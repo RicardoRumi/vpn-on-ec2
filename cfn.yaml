@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to launch an Ubuntu EC2 instance with a Security Group that allows traffic on port 1194, enables EC2 Instance Connect, and creates an S3 bucket.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The Subnet Id where the EC2 instance will be launched.
+  VpcId:
+    Type: String
+    Description: The VPC Id where the EC2 instance will be launched.
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance.
+
+Resources:
+  MyS3Bucket:
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-s3bucket"
+
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: 't2.micro'
+      ImageId: 'ami-053b0d53c279acc90'
+      KeyName:
+        Ref: KeyName
+      Tags:
+        - Key: 'Name'
+          Value: 'open-vpn-1-teste'
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: 'true'
+          DeviceIndex: '0'
+          SubnetId:
+            Ref: SubnetId
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+      IamInstanceProfile:
+        Ref: InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update
+          curl -O https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
+          mv openvpn-install.sh /usr/local/bin/
+          chmod +x /usr/local/bin/openvpn-install.sh
+          APPROVE_INSTALL=y ENDPOINT=$(curl -4 icanhazip.com) APPROVE_IP=y IPV6_SUPPORT=n PORT_CHOICE=1 PROTOCOL_CHOICE=1 DNS=1 COMPRESSION_ENABLED=n CUSTOMIZE_ENC=n CLIENT=david PASS=1 /usr/local/bin/openvpn-install.sh
+          MENU_OPTION="1" CLIENT="candy" PASS="1" /usr/local/bin/openvpn-install.sh
+          MENU_OPTION="1" CLIENT="john" PASS="1" /usr/local/bin/openvpn-install.sh
+          apt-get install -y awscli
+
+          # Moving .ovpn files from root to ubuntu's home directory
+          mv /root/*.ovpn /home/ubuntu/
+
+          # Syncing .ovpn files from ubuntu's home directory to S3
+          aws s3 sync /home/ubuntu s3://${MyS3Bucket}/ubuntu/ --exclude "*" --include "*.ovpn"
+
+          # Setting up aliases and permissions
+          echo 'alias vpn="sudo /usr/local/bin/openvpn-install.sh"' >> /home/ubuntu/.bashrc
+          echo 'alias s3sync="aws s3 sync /home/ubuntu s3://${MyS3Bucket}/ubuntu/ --exclude \"*\" --include \"*.ovpn\" --delete"' >> /home/ubuntu/.bashrc
+
+          echo 'ubuntu ALL=(ALL) NOPASSWD: /usr/local/bin/openvpn-install.sh' > /etc/sudoers.d/ubuntu-vpn
+          chmod 0440 /etc/sudoers.d/ubuntu-vpn
+
+          # Ensuring .bashrc is sourced for non-interactive sessions
+          echo 'if [ -n "$BASH_VERSION" ]; then' >> /etc/profile
+          echo '    # include .bashrc if it exists' >> /etc/profile
+          echo '    if [ -f "/home/ubuntu/.bashrc" ]; then' >> /etc/profile
+          echo '        . "/home/ubuntu/.bashrc"' >> /etc/profile
+          echo '    fi' >> /etc/profile
+          echo 'fi' >> /etc/profile
+
+
+  MyElasticIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      InstanceId:
+        Ref: EC2Instance
+
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security Group for EC2 instance to allow traffic on port 1194 and enables SSH.
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '1194'
+          ToPort: '1194'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: udp
+          FromPort: '1194'
+          ToPort: '1194'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'
+
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - Ref: EC2InstanceConnectRole
+
+  EC2InstanceConnectRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "EC2InstanceConnectPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "ec2-instance-connect:SendSSHPublicKey"
+                Resource: "*"
+        - PolicyName: "S3PutPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub "arn:aws:s3:::${MyS3Bucket}"
+                  - !Sub "arn:aws:s3:::${MyS3Bucket}/*"
